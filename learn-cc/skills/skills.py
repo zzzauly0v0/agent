@@ -1,6 +1,7 @@
 import os
 import json
 import ast
+import yaml
 import subprocess
 from pathlib import Path
 from anthropic import AnthropicBedrock
@@ -11,6 +12,7 @@ load_dotenv(override=True)
 WORKDIR = Path.cwd()
 MODEL = os.getenv("BEDROCK_MODEL_ID")
 CURRENT_TODOS: list[dict] = []
+SKILLS_DIR = WORKDIR / "skills"
 api_key = os.getenv("BEDROCK_API_KEY")
 aws_region = os.getenv("AWS_REGION")
 
@@ -21,6 +23,83 @@ client = AnthropicBedrock(
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use bash to solve tasks. Act, don't explain."
 
+# new 
+def _parse_frontmatter(text: str) -> tuple[dict, str]:
+    """解析文本中的 YAML frontmatter。
+
+    Args:
+        text: 包含 YAML frontmatter 和正文内容的原始输入字符串。
+
+    Returns:
+        一个包含以下两个元素的元组：
+            - meta (dict): 解析出的元数据字典。如果解析失败或不存在 frontmatter，
+              则返回空字典。
+            - body (str): 移除了 frontmatter 之后的剩余正文内容。
+    """
+    # 你的代码实现...
+    if not text.startswith("---\n"):
+        return {}, text
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return {}, text
+    try:
+        # 得到skill的标题
+        meta = yaml.safe_load(parts[1]) or {}
+    except yaml.YAMLError:
+        meta = {}
+    if not isinstance(meta, dict):
+        meta = {}
+    return meta, parts[2].strip()
+
+SKILL_REGISTRY: dict[str, dict] = {}
+
+def _scan_skills():
+    if not SKILLS_DIR.exists():
+        return
+    for d in sorted(SKILLS_DIR.iterdir()):
+        # 查找skill目录
+        if not d.is_dir():
+            continue
+        manifest = d / "SKILL.md"
+        # In an standard SIILL.md template, we can find the basic structure of this 
+        # ---
+        # name: roll-dice
+        # description: Roll dice using a random number generator. Use when asked to roll a die (d6, d20, etc.), roll dice, or generate a random dice roll.
+        # ---
+
+        # To roll a die, use the following command that generates a random number from 1
+        # to the given number of sides:
+
+        if manifest.exists():
+
+            raw = manifest.read_text()
+            meta, body = _parse_frontmatter(raw)
+            # 首先处理meta
+            name = meta.get("name") or d.name
+            # 直接获取description的value数据, 如果前者不存在, 用正文首行兜底
+            desc = meta.get("description") or body.split("\n", 1)[0].lstrip("#").strip()
+            SKILL_REGISTRY[name] = {"name": name, "description": desc, "content": body}
+
+_scan_skills()
+
+def list_skills() -> str:
+    if not SKILL_REGISTRY:
+        return "(no skills found)"
+    return "\n".join(f"- **{s['name']}**: {s['description']}" for s in SKILL_REGISTRY.values())
+
+def build_system() -> str:
+    """Build SYSTEM prompt with skill catalog injected at startup."""
+    catalog = list_skills()
+    return (
+        f"You are a coding agent at {WORKDIR}. "
+        f"Skills available:\n{catalog}\n"
+        "Use load_skill to get full details when needed."
+    )
+
+SYSTEM = build_system()
+
+
+# s07: subagent gets its own system prompt — no skill loading, no task
 SUB_SYSTEM = (
     f"You are a coding agent at {WORKDIR}. "
     "Complete the task you were given, then return a concise summary. "
@@ -87,6 +166,7 @@ def run_glob(pattern: str) -> str:
         return f"Error: {e}"
 
 def _normalize_todos(todos):
+    """ """
     if isinstance(todos, str):
         try:
             todos = json.loads(todos)
@@ -220,6 +300,7 @@ SUB_TOOLS = [
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
     {"name": "glob", "description": "Find files matching a glob pattern.",
      "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
+    {}
 ]
 
 SUB_HANDLERS = {
@@ -260,6 +341,7 @@ def spawn_subagent(description: str) -> str:
         )
 
         messages.append({"role": "assistant", "content": response.content})
+
         if response.stop_reason != "tool_use":
             break
 
@@ -294,6 +376,12 @@ def spawn_subagent(description: str) -> str:
             result = "Subagent stopped after 30 turns without final answer."
     print(f"\033[35m[Subagent done]\033[0m")
     return result
+
+def load_skill(name: str) -> str:
+    skill = SKILL_REGISTRY.get(name)
+    if not skill:
+        return f"Skill not found: {name}"
+    return skill["content"]
 
 TOOLS.append({
     "name": "task",
